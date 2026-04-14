@@ -13,6 +13,7 @@ CURATED_BUCKET = os.environ["CURATED_BUCKET"]
 LATEST_PRICES_TABLE = os.environ["LATEST_PRICES_TABLE"]
 PIPELINE_RUNS_TABLE = os.environ["PIPELINE_RUNS_TABLE"]
 DAILY_ALERT_THRESHOLD_PCT = Decimal(os.environ.get("DAILY_ALERT_THRESHOLD_PCT", "5"))
+CURATED_PREFIX = os.environ.get("CURATED_PREFIX", "operational")
 
 
 def _to_decimal(value):
@@ -93,7 +94,7 @@ def lambda_handler(event, _context):
             })
 
     curated_key = (
-        f"year={processed_at:%Y}/month={processed_at:%m}/day={processed_at:%d}/"
+        f"{CURATED_PREFIX}/year={processed_at:%Y}/month={processed_at:%m}/day={processed_at:%d}/"
         f"run_id={run_id}/prices.ndjson"
     )
     curated_body = "\n".join(json.dumps(record, default=_serialize_decimal) for record in records)

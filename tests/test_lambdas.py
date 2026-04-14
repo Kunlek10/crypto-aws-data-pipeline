@@ -68,6 +68,7 @@ class IngestPricesTests(unittest.TestCase):
         raw_record = json.loads(s3_kwargs["Body"].decode("utf-8"))
         self.assertEqual(raw_record["source"], "coingecko")
         self.assertEqual(len(raw_record["data"]), 2)
+        self.assertIn("bronze/year=", result["raw_key"])
 
 
 class TransformPricesTests(unittest.TestCase):
@@ -111,7 +112,8 @@ class TransformPricesTests(unittest.TestCase):
                 "CURATED_BUCKET": "curated-bucket",
                 "LATEST_PRICES_TABLE": "latest-prices",
                 "PIPELINE_RUNS_TABLE": "pipeline-runs",
-                "DAILY_ALERT_THRESHOLD_PCT": "4"
+                "DAILY_ALERT_THRESHOLD_PCT": "4",
+                "CURATED_PREFIX": "operational"
             },
             boto3_client=s3_client,
             boto3_resource=dynamodb_resource
@@ -136,6 +138,7 @@ class TransformPricesTests(unittest.TestCase):
         self.assertEqual(first_record["daily_change_pct"], 5.0)
         self.assertEqual(second_record["asset_symbol"], "ETH")
         self.assertIsNone(second_record["daily_change_pct"])
+        self.assertIn("operational/year=", result["curated_key"])
 
 
 class SendAlertsTests(unittest.TestCase):

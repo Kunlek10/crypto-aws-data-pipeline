@@ -6,6 +6,7 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INFRA_DIR="$PROJECT_ROOT/infra"
 TEMPLATE_FILE="$INFRA_DIR/template.yaml"
 PACKAGED_TEMPLATE_FILE="$INFRA_DIR/packaged.yaml"
+GLUE_DIR="$PROJECT_ROOT/src/glue"
 
 : "${ARTIFACT_BUCKET:?Set ARTIFACT_BUCKET to the S3 bucket used for CloudFormation packaging.}"
 : "${ALERT_EMAIL:?Set ALERT_EMAIL to the email that should receive SNS alerts.}"
@@ -20,6 +21,11 @@ DEFAULT_CURRENCY="${DEFAULT_CURRENCY:-usd}"
 ASSETS="${ASSETS:-bitcoin,ethereum}"
 
 echo "Using AWS region: $AWS_REGION"
+echo "Uploading Glue ETL scripts..."
+
+aws s3 cp "$GLUE_DIR/bronze_to_silver.py" "s3://$ARTIFACT_BUCKET/glue/bronze_to_silver.py" --region "$AWS_REGION"
+aws s3 cp "$GLUE_DIR/silver_to_gold.py" "s3://$ARTIFACT_BUCKET/glue/silver_to_gold.py" --region "$AWS_REGION"
+
 echo "Packaging CloudFormation template..."
 
 aws cloudformation package \
@@ -39,6 +45,7 @@ aws cloudformation deploy \
     ProjectName="$PROJECT_NAME" \
     Environment="$ENVIRONMENT" \
     AlertEmail="$ALERT_EMAIL" \
+    ArtifactBucket="$ARTIFACT_BUCKET" \
     PriceScheduleExpression="$PRICE_SCHEDULE_EXPRESSION" \
     DailyAlertThresholdPct="$DAILY_ALERT_THRESHOLD_PCT" \
     DefaultCurrency="$DEFAULT_CURRENCY" \

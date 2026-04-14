@@ -11,6 +11,12 @@ ALERT_EMAIL=you@example.com \
 ./deploy.sh
 ```
 
+The deploy script now:
+
+- uploads the Glue ETL scripts to the artifact bucket
+- packages the Lambda code for CloudFormation
+- deploys the medallion architecture stack
+
 Optional environment variables:
 
 - `AWS_REGION` defaults to `us-east-1`

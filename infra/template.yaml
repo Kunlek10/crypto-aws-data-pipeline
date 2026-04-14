@@ -29,6 +29,9 @@ Parameters:
     Type: CommaDelimitedList
     Default: bitcoin,ethereum
     Description: Assets fetched from the external API.
+  ArtifactBucket:
+    Type: String
+    Description: S3 bucket used for CloudFormation packaging artifacts and Glue scripts.
 
 Resources:
   RawBucket:
@@ -54,6 +57,25 @@ Resources:
     Type: AWS::S3::Bucket
     Properties:
       BucketName: !Sub ${ProjectName}-${Environment}-curated-${AWS::AccountId}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  GoldBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${ProjectName}-${Environment}-gold-${AWS::AccountId}
       BucketEncryption:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
@@ -156,6 +178,7 @@ Resources:
                 Resource:
                   - !Sub ${RawBucket.Arn}/*
                   - !Sub ${CuratedBucket.Arn}/*
+                  - !Sub ${GoldBucket.Arn}/*
               - Effect: Allow
                 Action:
                   - dynamodb:GetItem
@@ -202,6 +225,7 @@ Resources:
           LATEST_PRICES_TABLE: !Ref LatestPricesTable
           PIPELINE_RUNS_TABLE: !Ref PipelineRunsTable
           DAILY_ALERT_THRESHOLD_PCT: !Sub '${DailyAlertThresholdPct}'
+          CURATED_PREFIX: operational
 
   SendAlertsFunction:
     Type: AWS::Lambda::Function
@@ -253,6 +277,167 @@ Resources:
                   - !GetAtt TransformPricesFunction.Arn
                   - !GetAtt SendAlertsFunction.Arn
                   - !GetAtt NotifyFailureFunction.Arn
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                  - glue:GetJobRun
+                  - glue:GetJobRuns
+                  - glue:BatchStopJobRun
+                Resource:
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/${ProjectName}-${Environment}-bronze-to-silver
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/${ProjectName}-${Environment}-silver-to-gold
+
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Environment}-glue-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub ${ProjectName}-${Environment}-glue-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub ${RawBucket.Arn}/*
+                  - !Sub ${CuratedBucket.Arn}/*
+                  - !Sub ${GoldBucket.Arn}/*
+                  - !Sub arn:aws:s3:::${ArtifactBucket}/*
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt RawBucket.Arn
+                  - !GetAtt CuratedBucket.Arn
+                  - !GetAtt GoldBucket.Arn
+                  - !Sub arn:aws:s3:::${ArtifactBucket}
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:CreateTable
+                  - glue:GetTable
+                  - glue:UpdateTable
+                  - glue:GetPartitions
+                  - glue:BatchCreatePartition
+                  - glue:BatchDeletePartition
+                  - glue:BatchUpdatePartition
+                Resource: '*'
+
+  BronzeGlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub ${ProjectName}_${Environment}_bronze
+
+  SilverGlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub ${ProjectName}_${Environment}_silver
+
+  GoldGlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub ${ProjectName}_${Environment}_gold
+
+  BronzeToSilverJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-bronze-to-silver
+      Role: !GetAtt GlueServiceRole.Arn
+      GlueVersion: '4.0'
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Sub s3://${ArtifactBucket}/glue/bronze_to_silver.py
+      DefaultArguments:
+        '--job-language': python
+        '--TempDir': !Sub s3://${ArtifactBucket}/glue-temp/
+        '--raw_bucket': !Ref RawBucket
+        '--raw_prefix': bronze/
+        '--silver_bucket': !Ref CuratedBucket
+        '--silver_prefix': silver/prices/
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      MaxRetries: 0
+      NumberOfWorkers: 2
+      WorkerType: G.1X
+
+  SilverToGoldJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-silver-to-gold
+      Role: !GetAtt GlueServiceRole.Arn
+      GlueVersion: '4.0'
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Sub s3://${ArtifactBucket}/glue/silver_to_gold.py
+      DefaultArguments:
+        '--job-language': python
+        '--TempDir': !Sub s3://${ArtifactBucket}/glue-temp/
+        '--silver_bucket': !Ref CuratedBucket
+        '--silver_prefix': silver/prices/
+        '--gold_bucket': !Ref GoldBucket
+        '--gold_prefix': gold/daily_summary/
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      MaxRetries: 0
+      NumberOfWorkers: 2
+      WorkerType: G.1X
+
+  BronzeCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-bronze-crawler
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref BronzeGlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub s3://${RawBucket}/bronze/
+      TablePrefix: bronze_
+
+  SilverCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-silver-crawler
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref SilverGlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub s3://${CuratedBucket}/silver/
+      TablePrefix: silver_
+
+  GoldCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-gold-crawler
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref GoldGlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub s3://${GoldBucket}/gold/
+      TablePrefix: gold_
 
   DailyPricesStateMachine:
     Type: AWS::StepFunctions::StateMachine
@@ -289,6 +474,36 @@ Resources:
                 "Parameters": {
                   "FunctionName": "${TransformPricesFunction.Arn}",
                   "Payload.$": "$"
+                },
+                "Next": "BronzeToSilver",
+                "Catch": [
+                  {
+                    "ErrorEquals": ["States.ALL"],
+                    "ResultPath": "$.error",
+                    "Next": "NotifyFailure"
+                  }
+                ]
+              },
+              "BronzeToSilver": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::glue:startJobRun.sync",
+                "Parameters": {
+                  "JobName": "${BronzeToSilverJob}"
+                },
+                "Next": "SilverToGold",
+                "Catch": [
+                  {
+                    "ErrorEquals": ["States.ALL"],
+                    "ResultPath": "$.error",
+                    "Next": "NotifyFailure"
+                  }
+                ]
+              },
+              "SilverToGold": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::glue:startJobRun.sync",
+                "Parameters": {
+                  "JobName": "${SilverToGoldJob}"
                 },
                 "Next": "SendAlerts",
                 "Catch": [
@@ -373,6 +588,22 @@ Outputs:
   CuratedBucketName:
     Description: S3 bucket for curated records.
     Value: !Ref CuratedBucket
+
+  GoldBucketName:
+    Description: S3 bucket for gold-layer analytics outputs.
+    Value: !Ref GoldBucket
+
+  BronzeDatabaseName:
+    Description: Glue database for the bronze medallion layer.
+    Value: !Ref BronzeGlueDatabase
+
+  SilverDatabaseName:
+    Description: Glue database for the silver medallion layer.
+    Value: !Ref SilverGlueDatabase
+
+  GoldDatabaseName:
+    Description: Glue database for the gold medallion layer.
+    Value: !Ref GoldGlueDatabase
 
   LatestPricesTableName:
     Description: DynamoDB table storing the latest snapshot for each asset.

@@ -29,7 +29,7 @@ def lambda_handler(event, _context):
         payload = json.loads(response.read().decode("utf-8"))
 
     key = (
-        f"year={now:%Y}/month={now:%m}/day={now:%d}/"
+        f"bronze/year={now:%Y}/month={now:%m}/day={now:%d}/"
         f"run_id={run_id}/prices.json"
     )
 
