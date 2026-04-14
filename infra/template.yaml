@@ -1,0 +1,387 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Daily batch pipeline for Bitcoin and Ethereum prices on AWS
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: crypto-batch-pipeline
+    Description: Base name used for AWS resources.
+  Environment:
+    Type: String
+    Default: dev
+    Description: Deployment environment name.
+  AlertEmail:
+    Type: String
+    Description: Email address subscribed to price and failure notifications.
+  PriceScheduleExpression:
+    Type: String
+    Default: cron(0 6 * * ? *)
+    Description: Daily EventBridge schedule expression in UTC.
+  DailyAlertThresholdPct:
+    Type: Number
+    Default: 5
+    Description: Absolute daily percentage change that triggers an alert.
+  DefaultCurrency:
+    Type: String
+    Default: usd
+    Description: Fiat currency for price lookups.
+  Assets:
+    Type: CommaDelimitedList
+    Default: bitcoin,ethereum
+    Description: Assets fetched from the external API.
+
+Resources:
+  RawBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${ProjectName}-${Environment}-raw-${AWS::AccountId}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  CuratedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${ProjectName}-${Environment}-curated-${AWS::AccountId}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  LatestPricesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${ProjectName}-${Environment}-latest-prices
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: asset_symbol
+          AttributeType: S
+      KeySchema:
+        - AttributeName: asset_symbol
+          KeyType: HASH
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  PipelineRunsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${ProjectName}-${Environment}-pipeline-runs
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: run_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: run_id
+          KeyType: HASH
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${ProjectName}-${Environment}-alerts
+
+  FailuresTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${ProjectName}-${Environment}-failures
+
+  AlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !Ref AlertEmail
+      Protocol: email
+      TopicArn: !Ref AlertsTopic
+
+  FailuresEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !Ref AlertEmail
+      Protocol: email
+      TopicArn: !Ref FailuresTopic
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Environment}-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub ${ProjectName}-${Environment}-lambda-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub ${RawBucket.Arn}/*
+                  - !Sub ${CuratedBucket.Arn}/*
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource:
+                  - !GetAtt LatestPricesTable.Arn
+                  - !GetAtt PipelineRunsTable.Arn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource:
+                  - !Ref AlertsTopic
+                  - !Ref FailuresTopic
+
+  IngestPricesFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-${Environment}-ingest-prices
+      Runtime: python3.12
+      Handler: app.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Code: ../src/lambdas/ingest_prices/
+      Environment:
+        Variables:
+          RAW_BUCKET: !Ref RawBucket
+          PIPELINE_RUNS: !Ref PipelineRunsTable
+          ASSETS: !Join [",", !Ref Assets]
+          DEFAULT_CURRENCY: !Ref DefaultCurrency
+
+  TransformPricesFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-${Environment}-transform-prices
+      Runtime: python3.12
+      Handler: app.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Code: ../src/lambdas/transform_prices/
+      Environment:
+        Variables:
+          CURATED_BUCKET: !Ref CuratedBucket
+          LATEST_PRICES_TABLE: !Ref LatestPricesTable
+          PIPELINE_RUNS_TABLE: !Ref PipelineRunsTable
+          DAILY_ALERT_THRESHOLD_PCT: !Ref DailyAlertThresholdPct
+
+  SendAlertsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-${Environment}-send-alerts
+      Runtime: python3.12
+      Handler: app.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Code: ../src/lambdas/send_alerts/
+      Environment:
+        Variables:
+          ALERTS_TOPIC_ARN: !Ref AlertsTopic
+
+  NotifyFailureFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-${Environment}-notify-failure
+      Runtime: python3.12
+      Handler: app.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Code: ../src/lambdas/notify_failure/
+      Environment:
+        Variables:
+          FAILURES_TOPIC_ARN: !Ref FailuresTopic
+
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Environment}-step-functions-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub ${ProjectName}-${Environment}-step-functions-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt IngestPricesFunction.Arn
+                  - !GetAtt TransformPricesFunction.Arn
+                  - !GetAtt SendAlertsFunction.Arn
+                  - !GetAtt NotifyFailureFunction.Arn
+
+  DailyPricesStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub ${ProjectName}-${Environment}-daily-prices
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+      DefinitionString:
+        !Sub |
+          {
+            "Comment": "Daily batch pipeline for crypto price ingestion and alerts",
+            "StartAt": "IngestPrices",
+            "States": {
+              "IngestPrices": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "OutputPath": "$.Payload",
+                "Parameters": {
+                  "FunctionName": "${IngestPricesFunction.Arn}",
+                  "Payload.$": "$"
+                },
+                "Next": "TransformPrices",
+                "Catch": [
+                  {
+                    "ErrorEquals": ["States.ALL"],
+                    "ResultPath": "$.error",
+                    "Next": "NotifyFailure"
+                  }
+                ]
+              },
+              "TransformPrices": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "OutputPath": "$.Payload",
+                "Parameters": {
+                  "FunctionName": "${TransformPricesFunction.Arn}",
+                  "Payload.$": "$"
+                },
+                "Next": "SendAlerts",
+                "Catch": [
+                  {
+                    "ErrorEquals": ["States.ALL"],
+                    "ResultPath": "$.error",
+                    "Next": "NotifyFailure"
+                  }
+                ]
+              },
+              "SendAlerts": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "OutputPath": "$.Payload",
+                "Parameters": {
+                  "FunctionName": "${SendAlertsFunction.Arn}",
+                  "Payload.$": "$"
+                },
+                "End": true,
+                "Catch": [
+                  {
+                    "ErrorEquals": ["States.ALL"],
+                    "ResultPath": "$.error",
+                    "Next": "NotifyFailure"
+                  }
+                ]
+              },
+              "NotifyFailure": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "OutputPath": "$.Payload",
+                "Parameters": {
+                  "FunctionName": "${NotifyFailureFunction.Arn}",
+                  "Payload.$": "$"
+                },
+                "End": true
+              }
+            }
+          }
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Environment}-scheduler-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub ${ProjectName}-${Environment}-scheduler-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Ref DailyPricesStateMachine
+
+  DailyTrigger:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-daily-trigger
+      Description: Daily trigger for crypto batch pipeline
+      ScheduleExpression: !Ref PriceScheduleExpression
+      ScheduleExpressionTimezone: UTC
+      FlexibleTimeWindow:
+        Mode: OFF
+      State: ENABLED
+      Target:
+        Arn: !Ref DailyPricesStateMachine
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"triggered_by":"eventbridge-scheduler"}'
+
+Outputs:
+  RawBucketName:
+    Description: S3 bucket for raw API responses.
+    Value: !Ref RawBucket
+
+  CuratedBucketName:
+    Description: S3 bucket for curated records.
+    Value: !Ref CuratedBucket
+
+  LatestPricesTableName:
+    Description: DynamoDB table storing the latest snapshot for each asset.
+    Value: !Ref LatestPricesTable
+
+  PipelineStateMachineArn:
+    Description: Step Functions state machine ARN.
+    Value: !Ref DailyPricesStateMachine
+
+  AlertsTopicArn:
+    Description: SNS topic used for price alerts.
+    Value: !Ref AlertsTopic
