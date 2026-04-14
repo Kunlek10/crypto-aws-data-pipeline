@@ -201,7 +201,7 @@ Resources:
           CURATED_BUCKET: !Ref CuratedBucket
           LATEST_PRICES_TABLE: !Ref LatestPricesTable
           PIPELINE_RUNS_TABLE: !Ref PipelineRunsTable
-          DAILY_ALERT_THRESHOLD_PCT: !Ref DailyAlertThresholdPct
+          DAILY_ALERT_THRESHOLD_PCT: !Sub '${DailyAlertThresholdPct}'
 
   SendAlertsFunction:
     Type: AWS::Lambda::Function
