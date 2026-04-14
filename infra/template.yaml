@@ -358,7 +358,7 @@ Resources:
       ScheduleExpression: !Ref PriceScheduleExpression
       ScheduleExpressionTimezone: UTC
       FlexibleTimeWindow:
-        Mode: OFF
+        Mode: 'OFF'
       State: ENABLED
       Target:
         Arn: !Ref DailyPricesStateMachine
